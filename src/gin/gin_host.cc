@@ -40,33 +40,90 @@ ncclResult_t ncclGetRailedGinType(struct ncclComm* comm, ncclGinType_t* ginType)
   return ncclSuccess;
 }
 
-void* ncclGinProgress(struct ncclGinState* ginState_) {
-  struct ncclGinState* ginState = (struct ncclGinState*)ginState_;
+// Per-thread progress worker. Thread `t` owns the contiguous GIN connection
+// range [connStart[t], connEnd[t]) (of backends[0]) across all registered
+// devComms in `ginState->devComms`. The state machine:
+//   1  : run -- traverse devComms and call ginProgress() on dc->ginCtx[n] for
+//        n in the thread's range.
+//   2  : pause requested -- ack by setting state to 0, notify, then wait.
+//   0  : paused -- wait for cond.
+//  -1  : exit (clean shutdown).
+//  -2  : errored (terminal).
+// State `1` releases mutex[t] before invoking the plugin so the main thread is
+// not blocked. Modifications to the devComms linked list and context teardown
+// are made safe by the pause protocol: setup/free transition all running
+// threads through 1 -> 2 -> 0 before mutating the list, then back to 1.
+void* ncclGinProgress(struct ncclGinState* ginState, int t) {
   struct ncclGinBackendState* backend = &ginState->backends[0];
   if (ncclOsCpuCount(ginState->cpuAffinity)) {
     ncclOsSetAffinity(ginState->cpuAffinity);
   }
   while (1) {
-    std::unique_lock<std::mutex> lock(ginState->mutex);
-    if (ginState->proxyThreadStopSignal) return NULL;
-    struct ncclGinStateDevComm* dc = ginState->devComms;
-    while (dc) {
-      for (int n = 0; n < backend->ginCommCount; n++) {
-        ncclResult_t ret = backend->ncclGin->ginProgress(dc->ginCtx[n]);
-        if (ret != ncclSuccess) {
-          COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
-          INFO_LOC(NCCL_ALL, "-> %d [GIN Progress Thread]", ret);
-          return NULL;
+    std::unique_lock<std::mutex> lock(ginState->mutex[t]);
+    if (ginState->ginProgress[t] == 1) {
+      lock.unlock();
+      struct ncclGinStateDevComm* dc = ginState->devComms;
+      while (dc) {
+        for (int n = ginState->connStart[t]; n < ginState->connEnd[t]; n++) {
+          ncclResult_t ret = backend->ncclGin->ginProgress(dc->ginCtx[n]);
+          if (ret != ncclSuccess) {
+            COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
+            INFO_LOC(NCCL_ALL, "-> %d [GIN Progress Thread %d]", ret, t);
+            std::lock_guard<std::mutex> errLock(ginState->mutex[t]);
+            ginState->ginProgress[t] = -2;
+            return NULL;
+          }
         }
+        dc = dc->next;
       }
-      dc = dc->next;
+      std::this_thread::yield();
+    } else if (ginState->ginProgress[t] == 2) {
+      // Pause requested: acknowledge and sleep. The main thread is mutating the
+      // devComms list (or freeing contexts) and will signal back to state 1.
+      ginState->ginProgress[t] = 0;
+      ginState->cond[t].notify_one();
+      ginState->cond[t].wait(lock);
+    } else if (ginState->ginProgress[t] == -1) {
+      return NULL;
+    } else if (ginState->ginProgress[t] == 0) {
+      ginState->cond[t].wait(lock);
+    } else {
+      INFO_LOC(NCCL_ALL, "[GIN Progress Thread %d] state unknown %d", t, ginState->ginProgress[t]);
+      ginState->ginProgress[t] = -2;
+      return NULL;
     }
-    lock.unlock();
-    std::this_thread::yield();
   }
 }
 
 NCCL_PARAM(GinNconnections, "GIN_NCONNECTIONS", -2);
+NCCL_PARAM(GinProxyNthreads, "GIN_PROXY_NTHREADS", 1);
+
+// Request all running progress threads to pause (state 1 -> 2 -> 0) and wait
+// for each to acknowledge. Threads that are already paused (0), exiting (-1),
+// or errored (-2) are left as-is. Used to safely mutate the devComms linked
+// list or free GIN contexts while no progress thread is iterating.
+static void pauseAllProgressThreads(struct ncclGinState* ginState) {
+  for (int t = 0; t < ginState->proxyNthreads; t++) {
+    std::unique_lock<std::mutex> lock(ginState->mutex[t]);
+    if (ginState->ginProgress[t] == 1) {
+      ginState->ginProgress[t] = 2;
+      ginState->cond[t].notify_one();
+      ginState->cond[t].wait(lock, [&] { return ginState->ginProgress[t] != 2; });
+    }
+  }
+}
+
+// Resume all paused progress threads (state 0 -> 1). Threads that are running,
+// exiting, or errored are left as-is.
+static void resumeAllProgressThreads(struct ncclGinState* ginState) {
+  for (int t = 0; t < ginState->proxyNthreads; t++) {
+    std::unique_lock<std::mutex> lock(ginState->mutex[t]);
+    if (ginState->ginProgress[t] == 0) {
+      ginState->ginProgress[t] = 1;
+      ginState->cond[t].notify_one();
+    }
+  }
+}
 
 ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
@@ -115,7 +172,36 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
     backend->ginCommCount = NCCL_GIN_MAX_CONNECTIONS;
   }
 
-  if (ncclParamGinNconnections() != -2) backend->ginCommCount = ncclParamGinNconnections();
+  // Resolve the number of GIN progress threads. Default 1; clamp to the valid
+  // range [1, NCCL_GIN_MAX_CONNECTIONS]. nthreads is a purely local concern
+  // (workers need not match across ranks), so it can be clamped per-rank.
+  int nthreads;
+  bool userSetNconn;
+  nthreads = (int)ncclParamGinProxyNthreads();
+  if (nthreads < 1) nthreads = 1;
+  if (nthreads > NCCL_GIN_MAX_CONNECTIONS) {
+    WARN("GIN_PROXY_NTHREADS=%d exceeds the maximum number of connections %d; clamping to %d", nthreads,
+         NCCL_GIN_MAX_CONNECTIONS, NCCL_GIN_MAX_CONNECTIONS);
+    nthreads = NCCL_GIN_MAX_CONNECTIONS;
+  }
+
+  userSetNconn = (ncclParamGinNconnections() != -2);
+  if (userSetNconn) {
+    backend->ginCommCount = ncclParamGinNconnections();
+    // If the user explicitly requested fewer connections than progress threads,
+    // we cannot satisfy the even distribution: fail rather than silently adjust.
+    if (nthreads > 1 && backend->ginCommCount < nthreads) {
+      WARN("GIN_NCONNECTIONS=%d is less than GIN_PROXY_NTHREADS=%d; increase GIN_NCONNECTIONS or reduce "
+           "GIN_PROXY_NTHREADS",
+           backend->ginCommCount, nthreads);
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  } else if (nthreads > 1) {
+    // GIN_NCONNECTIONS unset: ensure there are at least as many connections as
+    // progress threads so that every thread owns a non-empty range.
+    backend->ginCommCount = std::max(backend->ginCommCount, nthreads);
+  }
   backend->ginCommCount = std::min<int>(NCCL_GIN_MAX_CONNECTIONS, backend->ginCommCount);
 
   ginCommCountHandles[comm->rank] = backend->ginCommCount;
@@ -123,6 +209,23 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   for (int r = 0; r < comm->nRanks; r++) {
     backend->ginCommCount = std::min(backend->ginCommCount, ginCommCountHandles[r]);
   }
+
+  // Now that the final connection count is known (after the cross-rank min),
+  // clamp the thread count to it: we never spawn empty-range threads.
+  if (nthreads > backend->ginCommCount) {
+    WARN("GIN_PROXY_NTHREADS=%d exceeds the resolved GIN connection count %d; clamping to %d", nthreads,
+         backend->ginCommCount, backend->ginCommCount);
+    nthreads = backend->ginCommCount;
+  }
+  if (nthreads < 1) nthreads = 1;
+  ginState->proxyNthreads = nthreads;
+  for (int t = 0; t < nthreads; t++) {
+    ginState->connStart[t] = t * backend->ginCommCount / nthreads;
+    ginState->connEnd[t] = (t + 1) * backend->ginCommCount / nthreads;
+    INFO(NCCL_INIT, "GIN progress thread %d owns connections [%d, %d)", t, ginState->connStart[t],
+         ginState->connEnd[t]);
+  }
+  INFO(NCCL_INIT, "GIN: %d connection(s) distributed across %d progress thread(s)", backend->ginCommCount, nthreads);
 
   NCCLCHECKGOTO(ncclCalloc(&allHandles, (size_t)comm->nRanks * NCCL_NET_HANDLE_MAXSIZE), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&handles, comm->nRanks), ret, fail);
@@ -267,6 +370,7 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
       1
   };
 
+  bool needsProxyProgress = false;
   for (int n = 0; n < backend->ginCommCount; n++) {
     NCCLCHECKGOTO(backend->ncclGin->createContext(backend->ginComms[n], &ginConfig, &ginStateDevComm->ginCtx[n],
                                                   &ginStateDevComm->devHandles[n]),
@@ -282,24 +386,41 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
     devComm->ginNetDeviceTypes[n] = ginStateDevComm->devHandles[n]->netDeviceType;
     devComm->ginHandles[n] = ginStateDevComm->devHandles[n]->handle;
 
-    // Start proxy thread if needed
-    if (ginStateDevComm->devHandles[n]->needsProxyProgress && !ginState->proxyThreadCreated) {
-      ginState->cpuAffinity = comm->cpuAffinity;
-      ginState->proxyThreadCreated = true;
-      ginState->thread = std::thread(ncclGinProgress, ginState);
-      ncclSetThreadName(ginState->thread, "NCCL GIN Progress%2d", comm->cudaDev);
-    }
+    if (ginStateDevComm->devHandles[n]->needsProxyProgress) needsProxyProgress = true;
   }
 
-  // Add devComm context to the list
+  // Add devComm context to the list and (re)start progress threads as needed.
   {
-    std::unique_lock<std::mutex> lock(ginState->mutex);
-    struct ncclGinStateDevComm* last = ginState->devComms;
-    if (last) {
-      while (last->next) last = last->next;
-      last->next = ginStateDevComm;
-    } else {
-      ginState->devComms = ginStateDevComm;
+    bool needsStart = needsProxyProgress && !ginState->threadsStarted;
+
+    // If threads are already running, pause them so we can mutate devComms safely.
+    if (ginState->threadsStarted) pauseAllProgressThreads(ginState);
+
+    // Append the new devComm. Safe under one of:
+    //  - threads not yet started (no concurrent reader), or
+    //  - all threads paused via pauseAllProgressThreads().
+    {
+      struct ncclGinStateDevComm* last = ginState->devComms;
+      if (last) {
+        while (last->next) last = last->next;
+        last->next = ginStateDevComm;
+      } else {
+        ginState->devComms = ginStateDevComm;
+      }
+    }
+
+    if (needsStart) {
+      // First-time start: spawn one progress thread per owned connection range.
+      ginState->cpuAffinity = comm->cpuAffinity;
+      for (int t = 0; t < ginState->proxyNthreads; t++) {
+        ginState->ginProgress[t] = 1;
+        ginState->thread[t] = std::thread([ginState, t] { ncclGinProgress(ginState, t); });
+        ncclSetThreadName(ginState->thread[t], "NCCL GIN Progress%2d-%d", comm->cudaDev, t);
+      }
+      ginState->threadsStarted = true;
+    } else if (ginState->threadsStarted) {
+      // Threads were paused above; wake them now that the list is updated.
+      resumeAllProgressThreads(ginState);
     }
   }
 
@@ -317,6 +438,10 @@ ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const*
   // Find the resource associated with this devComm. Use the gin handle as key.
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
   struct ncclGinBackendState* backend = &ginState->backends[0];
+
+  // Locate the devComm. This is a read-only traversal; progress threads also
+  // only read the list and devComm setup/free is serialized by the caller, so
+  // it is safe to search without pausing.
   struct ncclGinStateDevComm *dc = ginState->devComms, *prevDc = NULL;
   while (1) {
     if (dc == NULL) {
@@ -328,18 +453,28 @@ ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const*
     dc = dc->next;
   }
 
-  std::unique_lock<std::mutex> lock(ginState->mutex);
-  // Remove from linked list
+  // Unlink `dc` with progress threads paused, then resume them immediately.
+  // The pause window is only the pointer update: once paused, every worker is
+  // parked at its loop top holding no devComm pointer, so after the unlink +
+  // resume a fresh traversal restarts from the head and can never observe `dc`
+  // again. We therefore destroy `dc`'s contexts *after* resuming, so the
+  // (potentially slow) destroyContext() calls do not stall progress on the
+  // remaining devComms -- matching the non-blocking teardown of the single
+  // progress thread it replaces.
+  if (ginState->threadsStarted) pauseAllProgressThreads(ginState);
   if (prevDc) prevDc->next = dc->next;
   else ginState->devComms = dc->next;
-  lock.unlock();
+  if (ginState->threadsStarted) resumeAllProgressThreads(ginState);
 
-  // Free GIN contexts
+  // `dc` is now unreachable by any progress thread; safe to destroy its
+  // contexts while the workers keep progressing the rest of the list.
+  ncclResult_t ret = ncclSuccess;
   for (int n = 0; n < backend->ginCommCount; n++) {
-    NCCLCHECK(backend->ncclGin->destroyContext(dc->ginCtx[n]));
+    ncclResult_t r = backend->ncclGin->destroyContext(dc->ginCtx[n]);
+    if (r != ncclSuccess && ret == ncclSuccess) ret = r;
   }
   free(dc);
-  return ncclSuccess;
+  return ret;
 }
 
 ncclResult_t ncclGinHostFinalize(struct ncclComm* comm) {
@@ -347,12 +482,20 @@ ncclResult_t ncclGinHostFinalize(struct ncclComm* comm) {
   if (!ginState->connected) return ncclSuccess;
   struct ncclGinBackendState* backend = &ginState->backends[0];
 
-  if (ginState->proxyThreadCreated) {
-    {
-      std::lock_guard<std::mutex> lock(ginState->mutex);
-      ginState->proxyThreadStopSignal = true;
+  if (ginState->threadsStarted) {
+    // Signal each progress thread to exit, then join. Errored threads (state
+    // -2) may have already returned; thread.join() is still valid as long as
+    // the std::thread is joinable, and a final -1 store under the per-thread
+    // mutex is harmless.
+    for (int t = 0; t < ginState->proxyNthreads; t++) {
+      std::lock_guard<std::mutex> lock(ginState->mutex[t]);
+      ginState->ginProgress[t] = -1;
+      ginState->cond[t].notify_one();
     }
-    ginState->thread.join();
+    for (int t = 0; t < ginState->proxyNthreads; t++) {
+      if (ginState->thread[t].joinable()) ginState->thread[t].join();
+    }
+    ginState->threadsStarted = false;
   }
 
   for (int n = 0; n < backend->ginCommCount; n++) {

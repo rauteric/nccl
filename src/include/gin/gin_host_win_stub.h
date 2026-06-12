@@ -96,8 +96,8 @@ struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;
-  bool proxyThreadCreated;
-  bool proxyThreadStopSignal;
+  int proxyNthreads;
+  bool threadsStarted;
   std::thread thread;
   std::mutex mutex;
   ncclResult_t asyncResult;
